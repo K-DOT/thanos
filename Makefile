@@ -119,11 +119,14 @@ define require_clean_work_tree
 
 endef
 
+help: ## Displays help.
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+
 .PHONY: all
 all: format build
 
-# assets repacks all static assets into go file for easier deploy.
 .PHONY: assets
+assets: # Repacks all static assets into go file for easier deploy.
 assets: $(GOBINDATA)
 	@echo ">> deleting asset file"
 	@rm pkg/ui/bindata.go || true
@@ -132,54 +135,52 @@ assets: $(GOBINDATA)
 	@go fmt ./pkg/ui
 
 
-# build builds Thanos binary using `promu`.
 .PHONY: build
+build: ## Builds Thanos binary using `promu`.
 build: check-git deps $(PROMU)
 	@echo ">> building binaries $(GOBIN)"
 	@$(PROMU) build --prefix $(PREFIX)
 
-# crossbuild builds all binaries for all platforms.
 .PHONY: crossbuild
+crossbuild: ## Builds all binaries for all platforms.
 crossbuild: $(PROMU)
 	@echo ">> crossbuilding all binaries"
 	$(PROMU) crossbuild -v
 
-# deps ensures fresh go.mod and go.sum.
 .PHONY: deps
-deps:
+deps: ## Ensures fresh go.mod and go.sum.
 	@go mod tidy
 	@go mod verify
+	$(call require_clean_work_tree,"run 'make deps'")
 
-# docker builds docker with no tag.
+
 .PHONY: docker
+docker: ## Builds 'thanos' docker with no tag.
 docker: build
 	@echo ">> building docker image 'thanos'"
 	@docker build -t "thanos" .
 
-#docker-multi-stage builds docker image using multi-stage.
 .PHONY: docker-multi-stage
+docker-multi-stage: ## Builds 'thanos' docker image using multi-stage.
 docker-multi-stage:
 	@echo ">> building docker image 'thanos' with Dockerfile.multi-stage"
 	@docker build -f Dockerfile.multi-stage -t "thanos" .
 
-# docker-push pushes docker image build under `thanos` to "$(DOCKER_IMAGE_REPO):$(DOCKER_IMAGE_TAG)"
 .PHONY: docker-push
+docker-push: ## Pushes 'thanos' docker image build to "$(DOCKER_IMAGE_REPO):$(DOCKER_IMAGE_TAG)".
 docker-push:
 	@echo ">> pushing image"
 	@docker tag "thanos" "$(DOCKER_IMAGE_REPO):$(DOCKER_IMAGE_TAG)"
 	@docker push "$(DOCKER_IMAGE_REPO):$(DOCKER_IMAGE_TAG)"
 
-# docs regenerates flags in docs for all thanos commands.
 .PHONY: docs
+docs: ## Regenerates flags in docs for all thanos commands.
 docs: $(EMBEDMD) build
 	@EMBEDMD_BIN="$(EMBEDMD)" SED_BIN="$(SED)" scripts/genflagdocs.sh
 	@find . -type f -name "*.md" | SED_BIN="$(SED)" xargs scripts/cleanup-white-noise.sh
 
-# check-docs checks:
-# - discrepancy with flags is valid
-# - links are valid
-# - white noise
 .PHONY: check-docs
+check-docs: ## checks docs against discrepancy with flags, links, white noise.
 check-docs: $(EMBEDMD) $(LICHE) build
 	@EMBEDMD_BIN="$(EMBEDMD)" SED_BIN="$(SED)" scripts/genflagdocs.sh check
 	@$(LICHE) --recursive docs --exclude "(couchdb.apache.org/bylaws.html|cloud.tencent.com|alibabacloud.com)" --document-root .
@@ -226,12 +227,8 @@ test: export THANOS_TEST_PROMETHEUS_VERSIONS= $(PROM_VERSIONS)
 test: export THANOS_TEST_ALERTMANAGER_PATH= $(ALERTMANAGER)
 test: check-git install-deps
 	@echo ">> install thanos GOOPTS=${GOOPTS}"
-	# Thanos binary is required by e2e tests.
-	@go install github.com/thanos-io/thanos/cmd/thanos
-	# Be careful on GOCACHE. Those tests are sometimes using built Thanos/Prometheus binaries directly. Don't cache those.
-	@rm -rf ${GOCACHE}
-	@echo ">> running all tests. Do export THANOS_TEST_OBJSTORE_SKIP=GCS,S3,AZURE,SWIFT,COS,ALIYUNOSS if you want to skip e2e tests against all real store buckets. Current value: ${THANOS_TEST_OBJSTORE_SKIP}"
-	@go test $(shell go list ./... | grep -v /vendor/);
+	@echo ">> running unit tests (without /test/e2e). Do export THANOS_TEST_OBJSTORE_SKIP=GCS,S3,AZURE,SWIFT,COS,ALIYUNOSS if you want to skip e2e tests against all real store buckets. Current value: ${THANOS_TEST_OBJSTORE_SKIP}"
+	@go test $(shell go list ./... | grep -v /vendor/ | grep -v /test/e2e/);
 
 .PHONY: test-ci
 test-ci: export THANOS_TEST_OBJSTORE_SKIP=AZURE,SWIFT,COS,ALIYUNOSS

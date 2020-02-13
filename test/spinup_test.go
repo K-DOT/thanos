@@ -1,12 +1,11 @@
 // Copyright (c) The Thanos Authors.
 // Licensed under the Apache License 2.0.
 
-package e2e_test
+package test_test
 
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -14,240 +13,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/oklog/run"
 	"github.com/pkg/errors"
 	"github.com/thanos-io/thanos/pkg/objstore/s3"
-	"github.com/thanos-io/thanos/pkg/receive"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 	"google.golang.org/grpc"
 )
-
-const portMin = 10000
-
-func remoteWriteEndpoint(addr address) string { return fmt.Sprintf("%s/api/v1/receive", addr.URL()) }
-
-type address struct {
-	host string
-	Port string
-}
-
-func (a address) HostPort() string {
-	return net.JoinHostPort(a.host, a.Port)
-}
-
-func (a address) URL() string {
-	return fmt.Sprintf("http://%s", net.JoinHostPort(a.host, a.Port))
-}
-
-// portPool allows to reserve ports within unit test. This naive implementation assumes that all ports from portMin-X are free outside.
-// No top boundary, no thread safety.
-// TODO(bwplotka): Make it more resilient.
-type portPool struct {
-	lastPort int
-}
-
-func (pp *portPool) New() int {
-	if pp.lastPort < portMin {
-		pp.lastPort = portMin - 1
-	}
-	pp.lastPort++
-	return pp.lastPort
-}
-
-type addresser struct {
-	host string
-	pp   *portPool
-}
-
-func (a *addresser) New() address {
-	return address{host: a.host, Port: fmt.Sprintf("%d", a.pp.New())}
-}
-
-func newLocalAddresser() *addresser {
-	// We keep this one with localhost, not 127.0.0.1 to have perfect match with what Prometheus will expose in up metric.
-	return &addresser{host: "localhost", pp: &portPool{}}
-}
-
-type Exec interface {
-	Start(stdout io.Writer, stderr io.Writer) error
-	Wait() error
-	Kill() error
-
-	String() string
-}
-
-type cmdExec struct {
-	*exec.Cmd
-}
-
-func newCmdExec(cmd *exec.Cmd) *cmdExec {
-	return &cmdExec{Cmd: cmd}
-}
-
-func (c *cmdExec) Start(stdout io.Writer, stderr io.Writer) error {
-	c.Stderr = stderr
-	c.Stdout = stdout
-	c.SysProcAttr = e2eutil.SysProcAttr()
-	return c.Cmd.Start()
-}
-
-func (c *cmdExec) Kill() error { return c.Process.Signal(syscall.SIGKILL) }
-
-func (c *cmdExec) String() string { return fmt.Sprintf("%s %v", c.Path, c.Args[1:]) }
-
-type scheduler interface {
-	Schedule(workDir string) (Exec, error)
-}
-
-type serverScheduler struct {
-	schedule func(workDir string) (Exec, error)
-
-	HTTP address
-	GRPC address
-}
-
-func (s *serverScheduler) Schedule(workDir string) (Exec, error) { return s.schedule(workDir) }
-
-type prometheusScheduler struct {
-	serverScheduler
-
-	RelDir string
-}
-
-func prometheus(http address, config string) *prometheusScheduler {
-	s := &prometheusScheduler{
-		RelDir: filepath.Join("data", "prom", http.Port),
-	}
-
-	s.serverScheduler = serverScheduler{
-		HTTP: http,
-		schedule: func(workDir string) (execs Exec, e error) {
-			promDir := filepath.Join(workDir, s.RelDir)
-			if err := os.MkdirAll(promDir, 0777); err != nil {
-				return nil, errors.Wrap(err, "create prom dir failed")
-			}
-
-			if err := ioutil.WriteFile(promDir+"/prometheus.yml", []byte(config), 0666); err != nil {
-				return nil, errors.Wrap(err, "creating prom config failed")
-			}
-
-			return newCmdExec(exec.Command(e2eutil.PrometheusBinary(),
-				"--config.file", promDir+"/prometheus.yml",
-				"--storage.tsdb.path", promDir,
-				"--storage.tsdb.max-block-duration", "2h",
-				"--log.level", "info",
-				"--web.listen-address", http.HostPort(),
-			)), nil
-		},
-	}
-	return s
-}
-
-func sidecar(http, grpc address, prom *prometheusScheduler) *serverScheduler {
-	return &serverScheduler{
-		HTTP: http,
-		GRPC: grpc,
-		schedule: func(workDir string) (Exec, error) {
-			promDir := filepath.Join(workDir, prom.RelDir)
-			return newCmdExec(exec.Command("thanos", "sidecar",
-				"--debug.name", fmt.Sprintf("sidecar-%s", http.Port),
-				"--grpc-address", grpc.HostPort(),
-				"--grpc-grace-period", "0s",
-				"--http-address", http.HostPort(),
-				"--prometheus.url", prom.HTTP.URL(),
-				"--tsdb.path", promDir,
-				"--log.level", "debug")), nil
-		},
-	}
-}
-
-func receiver(http, grpc, metric address, replicationFactor int, hashring ...receive.HashringConfig) *serverScheduler {
-	if len(hashring) == 0 {
-		hashring = []receive.HashringConfig{{Endpoints: []string{grpc.HostPort()}}}
-	}
-
-	return &serverScheduler{
-		HTTP: http,
-		GRPC: grpc,
-		schedule: func(workDir string) (Exec, error) {
-			receiveDir := filepath.Join(workDir, "data", "receive", http.Port)
-			if err := os.MkdirAll(receiveDir, 0777); err != nil {
-				return nil, errors.Wrap(err, "create receive dir")
-			}
-
-			b, err := json.Marshal(hashring)
-			if err != nil {
-				return nil, errors.Wrapf(err, "generate hashring file: %v", hashring)
-			}
-
-			if err := ioutil.WriteFile(filepath.Join(receiveDir, "hashrings.json"), b, 0666); err != nil {
-				return nil, errors.Wrap(err, "creating receive config")
-			}
-
-			return newCmdExec(exec.Command("thanos", "receive",
-				"--debug.name", fmt.Sprintf("receive-%s", http.Port),
-				"--grpc-address", grpc.HostPort(),
-				"--grpc-grace-period", "0s",
-				"--http-address", metric.HostPort(),
-				"--remote-write.address", http.HostPort(),
-				"--label", fmt.Sprintf(`receive="%s"`, http.Port),
-				"--tsdb.path", filepath.Join(receiveDir, "tsdb"),
-				"--log.level", "debug",
-				"--receive.replication-factor", strconv.Itoa(replicationFactor),
-				"--receive.local-endpoint", grpc.HostPort(),
-				"--receive.hashrings-file", filepath.Join(receiveDir, "hashrings.json"),
-				"--receive.hashrings-file-refresh-interval", "5s")), nil
-		},
-	}
-}
-
-func querier(http, grpc address, storeAddresses []address, fileSDStoreAddresses []address) *serverScheduler {
-	const replicaLabel = "replica"
-	return &serverScheduler{
-		HTTP: http,
-		GRPC: grpc,
-		schedule: func(workDir string) (Exec, error) {
-			args := []string{
-				"query",
-				"--debug.name", fmt.Sprintf("querier-%s", http.Port),
-				"--grpc-address", grpc.HostPort(),
-				"--grpc-grace-period", "0s",
-				"--http-address", http.HostPort(),
-				"--log.level", "debug",
-				"--query.replica-label", replicaLabel,
-				"--store.sd-dns-interval", "5s",
-			}
-			for _, addr := range storeAddresses {
-				args = append(args, "--store", addr.HostPort())
-			}
-
-			if len(fileSDStoreAddresses) > 0 {
-				queryFileSDDir := filepath.Join(workDir, "data", "querier", http.Port)
-				if err := os.MkdirAll(queryFileSDDir, 0777); err != nil {
-					return nil, errors.Wrap(err, "create query dir failed")
-				}
-
-				if err := ioutil.WriteFile(queryFileSDDir+"/filesd.json", []byte(generateFileSD(fileSDStoreAddresses)), 0666); err != nil {
-					return nil, errors.Wrap(err, "creating query SD config failed")
-				}
-
-				args = append(args,
-					"--store.sd-files", filepath.Join(queryFileSDDir, "filesd.json"),
-					"--store.sd-interval", "5s",
-				)
-			}
-
-			return newCmdExec(exec.Command("thanos", args...)), nil
-		},
-	}
-}
 
 func storeGateway(http, grpc address, bucketConfig []byte, relabelConfig []byte) *serverScheduler {
 	return &serverScheduler{

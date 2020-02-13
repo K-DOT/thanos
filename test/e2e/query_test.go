@@ -7,17 +7,17 @@ import (
 	"context"
 	"fmt"
 	"net/url"
-	"os"
 	"sort"
 	"testing"
 	"time"
 
-	"github.com/go-kit/kit/log"
+	"github.com/cortexproject/cortex/integration/e2e"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/thanos-io/thanos/test/e2e/e2ethanos"
 )
 
 // NOTE: by using aggregation all results are now unsorted.
@@ -56,127 +56,99 @@ func sortResults(res model.Vector) {
 }
 
 func TestQuery(t *testing.T) {
-	a := newLocalAddresser()
+	t.Parallel()
 
-	// Thanos Receive.
-	r := receiver(a.New(), a.New(), a.New(), 1)
+	s, err := e2e.NewScenario("e2e_test_query")
+	testutil.Ok(t, err)
+	defer s.Close()
 
-	// Prometheus-es.
-	prom1 := prometheus(a.New(), defaultPromConfig("prom-alone", 0, ""))
-	prom2 := prometheus(a.New(), defaultPromConfig("prom-both-remote-write-and-sidecar", 1234, remoteWriteEndpoint(r.HTTP)))
-	prom3 := prometheus(a.New(), defaultPromConfig("prom-ha", 0, ""))
-	prom4 := prometheus(a.New(), defaultPromConfig("prom-ha", 1, ""))
+	receiver, err := e2ethanos.NewReceiver(s.SharedDir(), "1", 1)
+	testutil.Ok(t, err)
 
-	// Sidecars per each Prometheus.
-	s1 := sidecar(a.New(), a.New(), prom1)
-	s2 := sidecar(a.New(), a.New(), prom2)
-	s3 := sidecar(a.New(), a.New(), prom3)
-	s4 := sidecar(a.New(), a.New(), prom4)
+	testutil.Ok(t, s.StartAndWaitReady(receiver))
+
+	prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(s.SharedDir(), "alone", defaultPromConfig("prom-alone", 0, ""), e2ethanos.DefaultPrometheusImage())
+	testutil.Ok(t, err)
+	prom2, sidecar2, err := e2ethanos.NewPrometheusWithSidecar(s.SharedDir(), "remote-and-sidecar", defaultPromConfig("prom-both-remote-write-and-sidecar", 1234, e2ethanos.RemoteWriteEndpoint(receiver.HTTPEndpoint())), e2ethanos.DefaultPrometheusImage())
+	testutil.Ok(t, err)
+	prom3, sidecar3, err := e2ethanos.NewPrometheusWithSidecar(s.SharedDir(), "ha1", defaultPromConfig("prom-ha", 0, ""), e2ethanos.DefaultPrometheusImage())
+	testutil.Ok(t, err)
+	prom4, sidecar4, err := e2ethanos.NewPrometheusWithSidecar(s.SharedDir(), "ha2", defaultPromConfig("prom-ha", 1, ""), e2ethanos.DefaultPrometheusImage())
+	testutil.Ok(t, err)
+
+	testutil.Ok(t, s.StartAndWaitReady(prom1, sidecar1, prom2, sidecar2, prom3, sidecar3, prom4, sidecar4))
 
 	// Querier. Both fileSD and directly by flags.
-	q := querier(a.New(), a.New(), []address{s1.GRPC, s2.GRPC, r.GRPC}, []address{s3.GRPC, s4.GRPC})
+	q, err := e2ethanos.NewQuerier(
+		s.SharedDir(), "1",
+		[]string{sidecar1.GRPCEndpoint(), sidecar2.GRPCEndpoint(), receiver.GRPCEndpoint()},
+		[]string{sidecar3.GRPCEndpoint(), sidecar4.GRPCEndpoint()},
+	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
 
-	exit, err := e2eSpinup(t, ctx, r, prom1, prom2, prom3, prom4, s1, s2, s3, s4, q)
-	if err != nil {
-		t.Errorf("spinup failed: %v", err)
-		cancel()
-		return
-	}
-
-	defer func() {
-		cancel()
-		<-exit
-	}()
-
-	var res model.Vector
-
-	w := log.NewSyncWriter(os.Stderr)
-	l := log.NewLogfmtLogger(w)
-
-	// Try query without deduplication.
-	testutil.Ok(t, runutil.RetryWithLog(l, time.Second, ctx.Done(), func() error {
-		select {
-		case <-exit:
-			cancel()
-			return nil
-		default:
-		}
-
-		var (
-			err      error
-			warnings []string
-		)
-		res, warnings, err = promclient.QueryInstant(ctx, nil, urlParse(t, q.HTTP.URL()), queryUpWithoutInstance, time.Now(), promclient.QueryOptions{
-			Deduplicate: false,
-		})
-		if err != nil {
-			return err
-		}
-
-		if len(warnings) > 0 {
-			// we don't expect warnings.
-			return errors.Errorf("unexpected warnings %s", warnings)
-		}
-
-		expectedRes := 5
-		if len(res) != expectedRes {
-			return errors.Errorf("unexpected result size, expected %d; result: %v", expectedRes, res)
-		}
-		return nil
-	}))
-
-	select {
-	case <-exit:
-		return
-	default:
-	}
-
-	sortResults(res)
-	testutil.Equals(t, model.Metric{
-		"job":        "test",
-		"prometheus": "prom-alone",
-		"replica":    "0",
-	}, res[0].Metric)
-	testutil.Equals(t, model.Metric{
-		"job":        "test",
-		"prometheus": "prom-both-remote-write-and-sidecar",
-		"receive":    model.LabelValue(r.HTTP.Port),
-		"replica":    model.LabelValue("1234"),
-	}, res[1].Metric)
-	testutil.Equals(t, model.Metric{
-		"job":        "test",
-		"prometheus": "prom-both-remote-write-and-sidecar",
-		"replica":    model.LabelValue("1234"),
-	}, res[2].Metric)
-	testutil.Equals(t, model.Metric{
-		"job":        "test",
-		"prometheus": "prom-ha",
-		"replica":    model.LabelValue("0"),
-	}, res[3].Metric)
-	testutil.Equals(t, model.Metric{
-		"job":        "test",
-		"prometheus": "prom-ha",
-		"replica":    model.LabelValue("1"),
-	}, res[4].Metric)
+	// TODO(bwplotka): Scenario should give us info if one container exited unexpectedly.
+	// Without deduplication.
+	queryAndAssert(t, ctx, q.HTTPEndpoint(), queryUpWithoutInstance, promclient.QueryOptions{
+		Deduplicate: true,
+	}, []model.Metric{
+		{
+			"job":        "test",
+			"prometheus": "prom-alone",
+			"replica":    "0",
+		},
+		{
+			"job":        "test",
+			"prometheus": "prom-both-remote-write-and-sidecar",
+			"receive":    model.LabelValue(receiver.Endpoint(81)),
+			"replica":    model.LabelValue("1234"),
+		},
+		{
+			"job":        "test",
+			"prometheus": "prom-both-remote-write-and-sidecar",
+			"replica":    model.LabelValue("1234"),
+		}, {
+			"job":        "test",
+			"prometheus": "prom-ha",
+			"replica":    model.LabelValue("0"),
+		}, {
+			"job":        "test",
+			"prometheus": "prom-ha",
+			"replica":    model.LabelValue("1"),
+		},
+	})
 
 	// With deduplication.
-	testutil.Ok(t, runutil.Retry(time.Second, ctx.Done(), func() error {
-		select {
-		case <-exit:
-			cancel()
-			return nil
-		default:
-		}
+	queryAndAssert(t, ctx, q.HTTPEndpoint(), queryUpWithoutInstance, promclient.QueryOptions{
+		Deduplicate: false,
+	}, []model.Metric{
+		{
+			"job":        "test",
+			"prometheus": "prom-alone",
+		},
+		{
+			"job":        "test",
+			"prometheus": "prom-both-remote-write-and-sidecar",
+		},
+		{
+			"job":        "test",
+			"prometheus": "prom-ha",
+		},
+	})
+}
 
-		var (
-			err      error
-			warnings []string
-		)
-		res, warnings, err = promclient.QueryInstant(ctx, nil, urlParse(t, q.HTTP.URL()), queryUpWithoutInstance, time.Now(), promclient.QueryOptions{
-			Deduplicate: true,
-		})
+func urlParse(t *testing.T, addr string) *url.URL {
+	u, err := url.Parse(addr)
+	testutil.Ok(t, err)
+
+	return u
+}
+
+func queryAndAssert(t *testing.T, ctx context.Context, addr string, query string, opts promclient.QueryOptions, expected []model.Metric) {
+	var result model.Vector
+	testutil.Ok(t, runutil.Retry(time.Second, ctx.Done(), func() error {
+		res, warnings, err := promclient.QueryInstant(ctx, nil, urlParse(t, addr), query, time.Now(), opts)
 		if err != nil {
 			return err
 		}
@@ -190,39 +162,12 @@ func TestQuery(t *testing.T) {
 		if len(res) != expectedRes {
 			return errors.Errorf("unexpected result size, expected %d; result: %v", expectedRes, res)
 		}
-
+		result = res
 		return nil
 	}))
 
-	select {
-	case <-exit:
-		return
-	default:
+	sortResults(result)
+	for i, exp := range expected {
+		testutil.Equals(t, exp, result[i].Metric)
 	}
-
-	sortResults(res)
-	testutil.Equals(t, model.Metric{
-		"job":        "test",
-		"prometheus": "prom-alone",
-	}, res[0].Metric)
-	testutil.Equals(t, model.Metric{
-		"job":        "test",
-		"prometheus": "prom-both-remote-write-and-sidecar",
-		"receive":    model.LabelValue(r.HTTP.Port),
-	}, res[1].Metric)
-	testutil.Equals(t, model.Metric{
-		"job":        "test",
-		"prometheus": "prom-both-remote-write-and-sidecar",
-	}, res[2].Metric)
-	testutil.Equals(t, model.Metric{
-		"job":        "test",
-		"prometheus": "prom-ha",
-	}, res[3].Metric)
-}
-
-func urlParse(t *testing.T, addr string) *url.URL {
-	u, err := url.Parse(addr)
-	testutil.Ok(t, err)
-
-	return u
 }
